@@ -75,7 +75,7 @@ impl Default for PairwiseParams {
             mismatch_score: -1,
             gap_open_penalty: -2,
             gap_extend_penalty: -1,
-            max_mismatches: 5,
+            max_mismatches: 8,
         }
     }
 }
@@ -98,11 +98,11 @@ impl Default for AnalysisParams {
         Self {
             method: AnalysisMethod::NoAmbiguities,
             pairwise: PairwiseParams::default(),
-            exclude_n: false,
+            exclude_n: true,
             min_oligo_length: 18,
             max_oligo_length: 25,
             resolution: 1,
-            coverage_threshold: 95.0,
+            coverage_threshold: 90.0,
             thread_count: ThreadCount::Auto,
         }
     }
