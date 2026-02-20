@@ -87,13 +87,64 @@ pub struct OligoscreenApp {
     // Deferred actions
     pending_save: bool,
     pending_remove_excl: Option<usize>,
+
+    // Output folder for auto-save
+    output_folder: Option<String>,
+
+    // Worklist
+    next_job_id: u64,
+    worklist: Vec<WorklistJob>,
+    completed_jobs: Vec<CompletedJob>,
+    worklist_state: WorklistState,
+    current_job_index: usize,
+    selected_completed_job_index: Option<usize>,
+    auto_save_error: Option<String>,
+    /// Total jobs at the start of a processing batch (for overall progress bar)
+    worklist_total_at_start: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Input,
     Analysis,
+    Worklist,
     Results,
+}
+
+/// A single job in the worklist queue.
+/// Captures all inputs and analysis parameters at the time of "Add to Worklist".
+struct WorklistJob {
+    id: u64,
+    // Captured inputs
+    template_file_name: String,
+    template_data: TemplateData,
+    reference_file_name: String,
+    reference_data: ReferenceData,
+    use_differential: bool,
+    exclusivity_file_names: Vec<String>,
+    exclusivity_data: Option<ReferenceData>,
+    // Captured params (fully resolved method, thread count applied at run time)
+    params: AnalysisParams,
+    // Output folder (optional, for auto-save)
+    output_folder: Option<String>,
+    // Summary info for display
+    template_length: usize,
+    reference_count: usize,
+    exclusivity_count: usize,
+}
+
+/// A completed job with its results.
+struct CompletedJob {
+    job: WorklistJob,
+    results: ScreeningResults,
+}
+
+/// Worklist processing state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorklistState {
+    Idle,
+    Processing,
+    StopRequested,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +207,15 @@ impl Default for OligoscreenApp {
             load_error: None,
             pending_save: false,
             pending_remove_excl: None,
+            output_folder: None,
+            next_job_id: 1,
+            worklist: Vec::new(),
+            completed_jobs: Vec::new(),
+            worklist_state: WorklistState::Idle,
+            current_job_index: 0,
+            selected_completed_job_index: None,
+            auto_save_error: None,
+            worklist_total_at_start: 0,
         }
     }
 }
@@ -200,16 +260,9 @@ impl OligoscreenApp {
         }
     }
 
-    fn start_analysis(&mut self) {
-        let Some(template) = &self.template_data else {
-            return;
-        };
-        let Some(references) = &self.reference_data else {
-            return;
-        };
-
-        // Update method from selection
-        self.params.method = match self.method_selection {
+    /// Resolve the current UI method selection into a concrete AnalysisMethod.
+    fn resolve_method(&self) -> AnalysisMethod {
+        match self.method_selection {
             MethodSelection::NoAmbiguities => AnalysisMethod::NoAmbiguities,
             MethodSelection::FixedAmbiguities => {
                 AnalysisMethod::FixedAmbiguities(self.params.method.get_fixed_ambiguities())
@@ -222,22 +275,125 @@ impl OligoscreenApp {
                 };
                 AnalysisMethod::Incremental(self.params.method.get_incremental_pct(), max_amb)
             }
+        }
+    }
+
+    /// Capture current inputs + params into a WorklistJob and clear the inputs.
+    fn add_to_worklist(&mut self) {
+        let Some(template_data) = self.template_data.clone() else {
+            return;
+        };
+        let Some(reference_data) = self.reference_data.clone() else {
+            return;
         };
 
-        // Update thread count from selection
-        self.params.thread_count = match self.thread_selection {
-            ThreadSelection::Auto => ThreadCount::Auto,
-            ThreadSelection::Manual => ThreadCount::Fixed(self.manual_thread_count),
-        };
+        let template_file_name = self.template_file_name.clone().unwrap_or_default();
+        let reference_file_name = self.reference_file_name.clone().unwrap_or_default();
 
-        let template_clone = template.clone();
-        let references_clone = references.clone();
-        let params_clone = self.params.clone();
-        let exclusivity_clone = if self.use_differential {
+        let mut params = self.params.clone();
+        params.method = self.resolve_method();
+
+        let exclusivity_file_names: Vec<String> = self
+            .exclusivity_files
+            .iter()
+            .map(|e| e.file_name.clone())
+            .collect();
+        let exclusivity_data = if self.use_differential {
             self.exclusivity_data.clone()
         } else {
             None
         };
+
+        let template_length = template_data.sequence.len();
+        let reference_count = reference_data.len();
+        let exclusivity_count = exclusivity_data.as_ref().map(|d| d.len()).unwrap_or(0);
+
+        let job = WorklistJob {
+            id: self.next_job_id,
+            template_file_name,
+            template_data,
+            reference_file_name,
+            reference_data,
+            use_differential: self.use_differential,
+            exclusivity_file_names,
+            exclusivity_data,
+            params,
+            output_folder: self.output_folder.clone(),
+            template_length,
+            reference_count,
+            exclusivity_count,
+        };
+
+        self.next_job_id += 1;
+        self.worklist.push(job);
+
+        // Clear input fields for next job
+        self.template_file_name = None;
+        self.template_data = None;
+        self.template_error = None;
+        self.reference_file_name = None;
+        self.reference_data = None;
+        self.reference_error = None;
+        self.exclusivity_files.clear();
+        self.exclusivity_data = None;
+        self.exclusivity_error = None;
+        self.use_differential = false;
+    }
+
+    fn select_output_folder(&mut self) {
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            self.output_folder = Some(path.to_string_lossy().to_string());
+        }
+    }
+
+    fn remove_worklist_job(&mut self, index: usize) {
+        if index < self.worklist.len() {
+            // Don't allow removing the currently-processing job
+            if self.worklist_state == WorklistState::Processing && index == self.current_job_index {
+                return;
+            }
+            self.worklist.remove(index);
+            if self.worklist_state == WorklistState::Processing && index < self.current_job_index {
+                self.current_job_index -= 1;
+            }
+        }
+    }
+
+    fn start_worklist_processing(&mut self) {
+        if self.worklist.is_empty() || self.worklist_state == WorklistState::Processing {
+            return;
+        }
+        self.worklist_state = WorklistState::Processing;
+        self.current_job_index = 0;
+        self.worklist_total_at_start = self.worklist.len();
+        self.start_next_job();
+    }
+
+    fn start_next_job(&mut self) {
+        if self.current_job_index >= self.worklist.len() {
+            self.worklist_state = WorklistState::Idle;
+            self.analysis_progress = None;
+            return;
+        }
+
+        if self.worklist_state == WorklistState::StopRequested {
+            self.worklist_state = WorklistState::Idle;
+            self.analysis_progress = None;
+            return;
+        }
+
+        let job = &self.worklist[self.current_job_index];
+
+        // Apply thread count from Worklist tab controls (not from job snapshot)
+        let mut params = job.params.clone();
+        params.thread_count = match self.thread_selection {
+            ThreadSelection::Auto => ThreadCount::Auto,
+            ThreadSelection::Manual => ThreadCount::Fixed(self.manual_thread_count),
+        };
+
+        let template_clone = job.template_data.clone();
+        let references_clone = job.reference_data.clone();
+        let exclusivity_clone = job.exclusivity_data.clone();
 
         let (progress_tx, progress_rx) = channel();
         let (results_tx, results_rx) = channel();
@@ -251,7 +407,7 @@ impl OligoscreenApp {
             let results = run_screening(
                 &template_clone,
                 &references_clone,
-                &params_clone,
+                &params,
                 exclusivity_clone.as_ref(),
                 Some(progress_tx),
             );
@@ -268,12 +424,65 @@ impl OligoscreenApp {
 
         if let Some(rx) = &self.results_rx {
             if let Ok(results) = rx.try_recv() {
-                self.view_coverage_threshold = results.params.coverage_threshold;
-                self.results = Some(results);
                 self.is_analyzing = false;
                 self.progress_rx = None;
                 self.results_rx = None;
-                self.current_tab = Tab::Results;
+
+                // Remove the completed job from the worklist
+                let job = self.worklist.remove(self.current_job_index);
+
+                // Auto-save if output folder is set
+                if let Some(ref folder) = job.output_folder {
+                    let folder = folder.clone();
+                    self.auto_save_results(&results, &folder, &job);
+                }
+
+                self.completed_jobs.push(CompletedJob { job, results });
+
+                // Select the newly completed job for viewing
+                let idx = self.completed_jobs.len() - 1;
+                self.selected_completed_job_index = Some(idx);
+                self.results = Some(self.completed_jobs[idx].results.clone());
+                self.view_coverage_threshold =
+                    self.completed_jobs[idx].results.params.coverage_threshold;
+                self.differential_mode = self.completed_jobs[idx].results.differential_enabled;
+
+                // current_job_index stays the same because we removed the element at it
+                self.start_next_job();
+            }
+        }
+    }
+
+    fn auto_save_results(
+        &mut self,
+        results: &ScreeningResults,
+        folder: &str,
+        job: &WorklistJob,
+    ) {
+        let sanitized_name: String = job
+            .template_file_name
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let file_name = format!("{}_{}.json", sanitized_name, job.id);
+        let path = std::path::Path::new(folder).join(file_name);
+
+        match serde_json::to_string_pretty(results) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    self.auto_save_error = Some(format!("Auto-save failed: {}", e));
+                } else {
+                    self.auto_save_error = None;
+                }
+            }
+            Err(e) => {
+                self.auto_save_error = Some(format!("Auto-save serialize failed: {}", e));
             }
         }
     }
@@ -304,7 +513,7 @@ impl OligoscreenApp {
         }
     }
 
-    fn load_results(&mut self) {
+    fn load_results_into_completed(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("JSON", &["json"])
             .pick_file()
@@ -312,10 +521,42 @@ impl OligoscreenApp {
             match std::fs::read_to_string(&path) {
                 Ok(json) => match serde_json::from_str::<ScreeningResults>(&json) {
                     Ok(results) => {
+                        let file_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "loaded".to_string());
+
+                        let job = WorklistJob {
+                            id: self.next_job_id,
+                            template_file_name: format!("(loaded) {}", file_name),
+                            template_data: TemplateData {
+                                name: "Loaded".to_string(),
+                                sequence: results.template_sequence.clone(),
+                            },
+                            reference_file_name: String::new(),
+                            reference_data: ReferenceData {
+                                names: Vec::new(),
+                                sequences: Vec::new(),
+                            },
+                            use_differential: results.differential_enabled,
+                            exclusivity_file_names: Vec::new(),
+                            exclusivity_data: None,
+                            params: results.params.clone(),
+                            output_folder: None,
+                            template_length: results.template_length,
+                            reference_count: results.total_sequences,
+                            exclusivity_count: results
+                                .exclusivity_sequence_count
+                                .unwrap_or(0),
+                        };
+                        self.next_job_id += 1;
+
                         self.view_coverage_threshold = results.params.coverage_threshold;
-                        self.differential_mode =
-                            self.differential_mode && results.differential_enabled;
-                        self.results = Some(results);
+                        self.differential_mode = results.differential_enabled;
+                        self.results = Some(results.clone());
+                        self.completed_jobs.push(CompletedJob { job, results });
+                        self.selected_completed_job_index =
+                            Some(self.completed_jobs.len() - 1);
                         self.load_error = None;
                         self.current_tab = Tab::Results;
                     }
@@ -503,11 +744,15 @@ impl eframe::App for OligoscreenApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Load Results...").clicked() {
-                        self.load_results();
+                    if ui.button("Load Results from File...").clicked() {
+                        self.load_results_into_completed();
                         ui.close_menu();
                     }
-                    if ui.button("Save Results...").clicked() {
+                    let can_save = self.results.is_some();
+                    if ui
+                        .add_enabled(can_save, egui::Button::new("Save Results..."))
+                        .clicked()
+                    {
                         self.save_results();
                         ui.close_menu();
                     }
@@ -520,7 +765,16 @@ impl eframe::App for OligoscreenApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.current_tab, Tab::Input, "Input Data");
                 ui.selectable_value(&mut self.current_tab, Tab::Analysis, "Analysis Setup");
-                ui.selectable_value(&mut self.current_tab, Tab::Results, "Results");
+                ui.selectable_value(
+                    &mut self.current_tab,
+                    Tab::Worklist,
+                    format!("Worklist ({})", self.worklist.len()),
+                );
+                ui.selectable_value(
+                    &mut self.current_tab,
+                    Tab::Results,
+                    format!("Results ({})", self.completed_jobs.len()),
+                );
             });
         });
 
@@ -530,36 +784,28 @@ impl eframe::App for OligoscreenApp {
                 if self.is_analyzing {
                     ui.spinner();
                     if let Some(ref progress) = self.analysis_progress {
-                        ui.label(&progress.message);
+                        ui.label(format!("Processing: {}", &progress.message));
                     } else {
-                        ui.label("Starting analysis...");
+                        ui.label("Starting job...");
                     }
-                } else if let Some(ref results) = self.results {
-                    let mut status = format!(
-                        "Results: {} references, {} bp template",
-                        results.total_sequences, results.template_length
-                    );
-                    if results.differential_enabled {
-                        if let Some(excl_count) = results.exclusivity_sequence_count {
-                            status.push_str(&format!(
-                                " | Differential: {} exclusivity sequences",
-                                excl_count
-                            ));
-                        }
-                    }
-                    ui.label(status);
+                } else if self.worklist_state == WorklistState::StopRequested {
+                    ui.label("Stopping after current job...");
                 } else {
                     let mut parts = Vec::new();
+                    if !self.completed_jobs.is_empty() {
+                        parts.push(format!(
+                            "{} completed",
+                            self.completed_jobs.len()
+                        ));
+                    }
+                    if !self.worklist.is_empty() {
+                        parts.push(format!("{} queued", self.worklist.len()));
+                    }
                     if let Some(ref t) = self.template_data {
                         parts.push(format!("Template: {} bp", t.sequence.len()));
                     }
                     if let Some(ref r) = self.reference_data {
-                        parts.push(format!("References: {} sequences", r.len()));
-                    }
-                    if self.use_differential {
-                        if let Some(ref e) = self.exclusivity_data {
-                            parts.push(format!("Exclusivity: {} sequences", e.len()));
-                        }
+                        parts.push(format!("References: {} seqs", r.len()));
                     }
                     if parts.is_empty() {
                         ui.label("Load template and reference sequences to begin");
@@ -575,6 +821,7 @@ impl eframe::App for OligoscreenApp {
             match self.current_tab {
                 Tab::Input => self.show_input_tab(ui),
                 Tab::Analysis => self.show_analysis_tab(ui),
+                Tab::Worklist => self.show_worklist_tab(ui),
                 Tab::Results => self.show_results_tab(ui),
             }
         });
@@ -739,29 +986,67 @@ impl OligoscreenApp {
                 }
             });
         }
+
+        ui.add_space(10.0);
+
+        // --- Output Folder ---
+        ui.group(|ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Output Folder (Optional)");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.output_folder.is_some() {
+                        if ui.button("Clear").clicked() {
+                            self.output_folder = None;
+                        }
+                    }
+                    if ui.button("Select Folder").clicked() {
+                        self.select_output_folder();
+                    }
+                });
+            });
+            ui.label(
+                "If set, results will be auto-saved as JSON to this folder after analysis.",
+            );
+            if let Some(ref folder) = self.output_folder {
+                ui.colored_label(egui::Color32::from_rgb(100, 200, 100), format!("Folder: {}", folder));
+            } else {
+                ui.colored_label(egui::Color32::GRAY, "No output folder selected (manual save only)");
+            }
+        });
+
+        ui.add_space(10.0);
+
+        // --- Add to Worklist ---
+        let can_add = self.template_data.is_some() && self.reference_data.is_some();
+        let warn_excl =
+            self.use_differential && self.exclusivity_data.is_none();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(can_add, egui::Button::new("Add to Worklist"))
+                .clicked()
+            {
+                self.add_to_worklist();
+            }
+            if !can_add {
+                ui.colored_label(
+                    egui::Color32::GRAY,
+                    "Load template and references first",
+                );
+            }
+            if warn_excl {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Differential enabled but no exclusivity files loaded",
+                );
+            }
+        });
     }
 
     fn show_analysis_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("Analysis Setup");
         ui.separator();
-
-        // Check if data is loaded
-        let has_template = self.template_data.is_some();
-        let has_references = self.reference_data.is_some();
-
-        if !has_template || !has_references {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                if !has_template && !has_references {
-                    "Please load template and reference sequences in the Input tab."
-                } else if !has_template {
-                    "Please load a template sequence in the Input tab."
-                } else {
-                    "Please load reference sequences in the Input tab."
-                },
-            );
-            return;
-        }
+        ui.label("These settings apply to all jobs added to the worklist.");
+        ui.add_space(5.0);
 
         egui::ScrollArea::vertical().show(ui, |ui| {
             // Pairwise Aligner Settings
@@ -952,91 +1237,303 @@ impl OligoscreenApp {
                 ui.label("Number of variants needed to reach this coverage will be reported");
             });
 
-            ui.add_space(10.0);
-
-            // Thread count
-            ui.group(|ui| {
-                ui.heading("Parallelization");
-
-                let available_threads = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1);
-
-                ui.horizontal(|ui| {
-                    ui.radio_value(
-                        &mut self.thread_selection,
-                        ThreadSelection::Auto,
-                        format!("Auto ({} threads)", available_threads),
-                    );
-                });
-
-                ui.horizontal(|ui| {
-                    ui.radio_value(
-                        &mut self.thread_selection,
-                        ThreadSelection::Manual,
-                        "Manual:",
-                    );
-                    let enabled = self.thread_selection == ThreadSelection::Manual;
-                    ui.add_enabled(
-                        enabled,
-                        egui::DragValue::new(&mut self.manual_thread_count)
-                            .range(1..=available_threads.max(32)),
-                    );
-                    ui.label("threads");
-                });
-
-                ui.label("More threads = faster analysis but higher CPU usage");
-            });
-
-            ui.add_space(20.0);
-
-            // Run button
-            ui.horizontal(|ui| {
-                let can_run = has_template && has_references && !self.is_analyzing;
-                if ui
-                    .add_enabled(can_run, egui::Button::new("Run Analysis"))
-                    .clicked()
-                {
-                    self.start_analysis();
-                }
-
-                if self.is_analyzing {
-                    ui.spinner();
-                    if let Some(ref progress) = self.analysis_progress {
-                        ui.label(&progress.message);
-                    }
-                }
-            });
-
-            // Warning if differential is on but no exclusivity data
-            if self.use_differential && self.exclusivity_data.is_none() {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "Differential analysis enabled but no exclusivity sequences loaded.",
-                );
-            }
         });
     }
 
+    fn show_worklist_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Worklist");
+        ui.separator();
+
+        // === Parallelization (moved from Analysis Setup) ===
+        ui.group(|ui| {
+            ui.heading("Parallelization");
+
+            let available_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+
+            ui.label(format!("Available parallelism: {} threads", available_threads));
+
+            ui.horizontal(|ui| {
+                ui.radio_value(
+                    &mut self.thread_selection,
+                    ThreadSelection::Auto,
+                    format!("Auto ({} threads)", available_threads),
+                );
+            });
+            ui.horizontal(|ui| {
+                ui.radio_value(
+                    &mut self.thread_selection,
+                    ThreadSelection::Manual,
+                    "Manual:",
+                );
+                let enabled = self.thread_selection == ThreadSelection::Manual;
+                ui.add_enabled(
+                    enabled,
+                    egui::DragValue::new(&mut self.manual_thread_count)
+                        .range(1..=available_threads.max(32)),
+                );
+                ui.label("threads");
+            });
+        });
+
+        ui.add_space(10.0);
+
+        // === Process / Stop Controls ===
+        ui.horizontal(|ui| {
+            let can_process =
+                !self.worklist.is_empty() && self.worklist_state == WorklistState::Idle;
+            if ui
+                .add_enabled(can_process, egui::Button::new("Process Worklist"))
+                .clicked()
+            {
+                self.start_worklist_processing();
+            }
+
+            let can_stop = self.worklist_state == WorklistState::Processing;
+            if ui
+                .add_enabled(can_stop, egui::Button::new("Stop After Current"))
+                .clicked()
+            {
+                self.worklist_state = WorklistState::StopRequested;
+            }
+
+            match self.worklist_state {
+                WorklistState::Idle => {}
+                WorklistState::Processing => {
+                    ui.spinner();
+                    let jobs_done =
+                        self.worklist_total_at_start - self.worklist.len();
+                    ui.label(format!(
+                        "Processing job {} of {}",
+                        jobs_done + 1,
+                        self.worklist_total_at_start
+                    ));
+                }
+                WorklistState::StopRequested => {
+                    ui.spinner();
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Stopping after current job...",
+                    );
+                }
+            }
+        });
+
+        ui.add_space(5.0);
+
+        // === Progress Bars ===
+        if self.worklist_state != WorklistState::Idle {
+            let jobs_done = self.worklist_total_at_start - self.worklist.len();
+            let overall_frac = if self.worklist_total_at_start > 0 {
+                jobs_done as f32 / self.worklist_total_at_start as f32
+            } else {
+                0.0
+            };
+            ui.horizontal(|ui| {
+                ui.label("Overall:");
+                ui.add(
+                    egui::ProgressBar::new(overall_frac).text(format!(
+                        "{}/{} jobs",
+                        jobs_done, self.worklist_total_at_start
+                    )),
+                );
+            });
+
+            if let Some(ref progress) = self.analysis_progress {
+                let job_frac = if progress.total_lengths > 0 {
+                    let length_frac =
+                        progress.lengths_completed as f32 / progress.total_lengths as f32;
+                    let pos_frac = if progress.total_positions > 0 {
+                        // Use completed count from the message (parsed from "Position X/Y")
+                        // Fall back to a rough estimate from position index
+                        (progress.lengths_completed as f32
+                            + (1.0 / progress.total_lengths as f32))
+                            .min(1.0)
+                    } else {
+                        0.0
+                    };
+                    let _ = pos_frac;
+                    length_frac
+                } else {
+                    0.0
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Current job:");
+                    ui.add(
+                        egui::ProgressBar::new(job_frac).text(&progress.message),
+                    );
+                });
+            }
+        }
+
+        ui.add_space(10.0);
+
+        // === Queued Jobs Table ===
+        ui.heading("Queued Jobs");
+        if self.worklist.is_empty() {
+            ui.colored_label(
+                egui::Color32::GRAY,
+                "No jobs queued. Use the Input Data tab to add jobs.",
+            );
+        } else {
+            let mut pending_remove: Option<usize> = None;
+
+            egui::ScrollArea::vertical()
+                .id_salt("worklist_scroll")
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    egui::Grid::new("worklist_grid")
+                        .striped(true)
+                        .min_col_width(40.0)
+                        .show(ui, |ui| {
+                            // Header
+                            ui.strong("");
+                            ui.strong("#");
+                            ui.strong("Template");
+                            ui.strong("References");
+                            ui.strong("Exclusivity");
+                            ui.strong("Oligo Range");
+                            ui.strong("Method");
+                            ui.strong("Output");
+                            ui.end_row();
+
+                            for (i, job) in self.worklist.iter().enumerate() {
+                                let is_current =
+                                    self.worklist_state == WorklistState::Processing
+                                        && i == self.current_job_index;
+
+                                if is_current {
+                                    ui.spinner();
+                                } else if ui.small_button("X").clicked() {
+                                    pending_remove = Some(i);
+                                }
+
+                                ui.label(format!("{}", job.id));
+                                ui.label(&job.template_file_name);
+                                ui.label(format!("{} seqs", job.reference_count));
+                                if job.use_differential {
+                                    ui.label(format!("{} seqs", job.exclusivity_count));
+                                } else {
+                                    ui.label("-");
+                                }
+                                ui.label(format!(
+                                    "{}-{} bp",
+                                    job.params.min_oligo_length,
+                                    job.params.max_oligo_length
+                                ));
+                                ui.label(job.params.method.description());
+                                if job.output_folder.is_some() {
+                                    ui.label("Auto-save");
+                                } else {
+                                    ui.label("-");
+                                }
+                                ui.end_row();
+                            }
+                        });
+                });
+
+            if let Some(idx) = pending_remove {
+                self.remove_worklist_job(idx);
+            }
+        }
+
+        // === Completed Jobs Summary ===
+        if !self.completed_jobs.is_empty() {
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label(format!(
+                "{} completed job(s) available in the Results tab.",
+                self.completed_jobs.len()
+            ));
+        }
+
+        // === Auto-save error ===
+        if let Some(ref err) = self.auto_save_error {
+            ui.colored_label(egui::Color32::RED, err);
+        }
+    }
+
     fn show_results_tab(&mut self, ui: &mut egui::Ui) {
-        if self.results.is_none() {
+        if self.completed_jobs.is_empty() {
             ui.heading("Results");
             ui.separator();
-            ui.label("No results yet. Run an analysis from the Analysis Setup tab.");
+            ui.label(
+                "No completed jobs yet. Add jobs in the Input tab and process them in the Worklist tab.",
+            );
+            ui.add_space(10.0);
+            if ui.button("Load Results from File").clicked() {
+                self.load_results_into_completed();
+            }
+            if let Some(ref error) = self.load_error {
+                ui.colored_label(egui::Color32::RED, error);
+            }
             return;
         }
 
-        let has_results = self.results.is_some();
-
+        // Job selector + header
         ui.horizontal(|ui| {
             ui.heading("Results");
+
+            ui.separator();
+            ui.label("Job:");
+
+            let selected_label = self
+                .selected_completed_job_index
+                .and_then(|i| self.completed_jobs.get(i))
+                .map(|cj| {
+                    format!("#{} - {}", cj.job.id, cj.job.template_file_name)
+                })
+                .unwrap_or_else(|| "Select a job".to_string());
+
+            let mut new_selection = self.selected_completed_job_index;
+            egui::ComboBox::from_id_salt("completed_job_selector")
+                .selected_text(&selected_label)
+                .show_ui(ui, |ui| {
+                    for (i, cj) in self.completed_jobs.iter().enumerate() {
+                        let label = format!(
+                            "#{} - {} ({} refs, {}-{} bp)",
+                            cj.job.id,
+                            cj.job.template_file_name,
+                            cj.job.reference_count,
+                            cj.job.params.min_oligo_length,
+                            cj.job.params.max_oligo_length,
+                        );
+                        ui.selectable_value(&mut new_selection, Some(i), label);
+                    }
+                });
+
+            // Sync results when selection changes
+            if new_selection != self.selected_completed_job_index {
+                self.selected_completed_job_index = new_selection;
+                if let Some(idx) = new_selection {
+                    if let Some(cj) = self.completed_jobs.get(idx) {
+                        self.results = Some(cj.results.clone());
+                        self.view_coverage_threshold = cj.results.params.coverage_threshold;
+                        self.differential_mode = cj.results.differential_enabled;
+                    }
+                }
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Save Results").clicked() && has_results {
+                if ui.button("Load Results from File").clicked() {
+                    self.load_results_into_completed();
+                }
+                let has_results = self.results.is_some();
+                if ui
+                    .add_enabled(has_results, egui::Button::new("Save Results"))
+                    .clicked()
+                {
                     self.pending_save = true;
                 }
             });
         });
         ui.separator();
+
+        if self.results.is_none() {
+            ui.label("Select a completed job to view its results.");
+            return;
+        }
 
         // Extract data we need
         let (lengths, template_seq, total_seqs, has_differential) = {
